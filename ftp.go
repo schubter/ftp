@@ -293,6 +293,10 @@ func (c *ServerConn) openDataConn() (net.Conn, error) {
 	return net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), c.timeout)
 }
 
+func (c *ServerConn) Cmd(expected int, format string, args ...interface{}) (int, string, error) {
+	return c.cmd(expected, format, args...)
+}
+
 // cmd is a helper function to execute a command and check for the expected FTP
 // return code
 func (c *ServerConn) cmd(expected int, format string, args ...interface{}) (int, string, error) {
