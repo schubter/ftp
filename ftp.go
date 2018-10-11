@@ -5,6 +5,7 @@ package ftp
 
 import (
 	"bufio"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -33,11 +34,13 @@ type ServerConn struct {
 	// Timezone that the server is in
 	Location *time.Location
 
-	conn          *textproto.Conn
-	host          string
-	timeout       time.Duration
-	features      map[string]string
-	mlstSupported bool
+	controlConnection net.Conn
+	textConnection    *textproto.Conn
+	host              string
+	timeout           time.Duration
+	features          map[string]string
+	mlstSupported     bool
+	TLSConfig         tls.Config
 }
 
 // Entry describes a file and is returned by List().
@@ -79,17 +82,18 @@ func DialTimeout(addr string, timeout time.Duration) (*ServerConn, error) {
 	// If we use the domain name, we might not resolve to the same IP.
 	remoteAddr := tconn.RemoteAddr().(*net.TCPAddr)
 
-	conn := textproto.NewConn(tconn)
+	textConnection := textproto.NewConn(tconn)
 
 	c := &ServerConn{
-		conn:     conn,
-		host:     remoteAddr.IP.String(),
-		timeout:  timeout,
-		features: make(map[string]string),
-		Location: time.UTC,
+		controlConnection: tconn,
+		textConnection:    textConnection,
+		host:              remoteAddr.IP.String(),
+		timeout:           timeout,
+		features:          make(map[string]string),
+		Location:          time.UTC,
 	}
 
-	_, _, err = c.conn.ReadResponse(StatusReady)
+	_, _, err = c.textConnection.ReadResponse(StatusReady)
 	if err != nil {
 		c.Quit()
 		return nil, err
@@ -106,6 +110,16 @@ func DialTimeout(addr string, timeout time.Duration) (*ServerConn, error) {
 	}
 
 	return c, nil
+}
+
+func (c *ServerConn) UpgradeConnectionToTLS() {
+	var tlsConnection *tls.Conn
+	tlsConnection = tls.Client(c.controlConnection, &c.TLSConfig)
+
+	tlsConnection.Handshake()
+	c.controlConnection = net.Conn(tlsConnection)
+	c.textConnection = textproto.NewConn(c.controlConnection)
+
 }
 
 // Login authenticates the client with specified user and password.
@@ -188,10 +202,10 @@ func (c *ServerConn) setUTF8() error {
 		return err
 	}
 
-        // Workaround for FTP servers, that does not support this option.
-        if code == StatusBadArguments {
-                return nil
-        }
+	// Workaround for FTP servers, that does not support this option.
+	if code == StatusBadArguments {
+		return nil
+	}
 
 	// The ftpd "filezilla-server" has FEAT support for UTF8, but always returns
 	// "202 UTF8 mode is always enabled. No need to send this command." when
@@ -300,12 +314,12 @@ func (c *ServerConn) Cmd(expected int, format string, args ...interface{}) (int,
 // cmd is a helper function to execute a command and check for the expected FTP
 // return code
 func (c *ServerConn) cmd(expected int, format string, args ...interface{}) (int, string, error) {
-	_, err := c.conn.Cmd(format, args...)
+	_, err := c.textConnection.Cmd(format, args...)
 	if err != nil {
 		return 0, "", err
 	}
 
-	return c.conn.ReadResponse(expected)
+	return c.textConnection.ReadResponse(expected)
 }
 
 // cmdDataConnFrom executes a command which require a FTP data connection.
@@ -324,13 +338,13 @@ func (c *ServerConn) cmdDataConnFrom(offset uint64, format string, args ...inter
 		}
 	}
 
-	_, err = c.conn.Cmd(format, args...)
+	_, err = c.textConnection.Cmd(format, args...)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
 
-	code, msg, err := c.conn.ReadResponse(-1)
+	code, msg, err := c.textConnection.ReadResponse(-1)
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -487,7 +501,7 @@ func (c *ServerConn) StorFrom(path string, r io.Reader, offset uint64) error {
 		return err
 	}
 
-	_, _, err = c.conn.ReadResponse(StatusClosingDataConnection)
+	_, _, err = c.textConnection.ReadResponse(StatusClosingDataConnection)
 	return err
 }
 
@@ -575,8 +589,8 @@ func (c *ServerConn) Logout() error {
 // Quit issues a QUIT FTP command to properly close the connection from the
 // remote FTP server.
 func (c *ServerConn) Quit() error {
-	c.conn.Cmd("QUIT")
-	return c.conn.Close()
+	c.textConnection.Cmd("QUIT")
+	return c.textConnection.Close()
 }
 
 // Read implements the io.Reader interface on a FTP data connection.
@@ -591,7 +605,7 @@ func (r *Response) Close() error {
 		return nil
 	}
 	err := r.conn.Close()
-	_, _, err2 := r.c.conn.ReadResponse(StatusClosingDataConnection)
+	_, _, err2 := r.c.textConnection.ReadResponse(StatusClosingDataConnection)
 	if err2 != nil {
 		err = err2
 	}
